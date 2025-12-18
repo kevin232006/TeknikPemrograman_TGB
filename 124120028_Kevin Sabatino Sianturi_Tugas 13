@@ -1,0 +1,191 @@
+import streamlit as st
+import segyio
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from segyio.tools import wrap
+import io
+
+# Konfigurasi Halaman
+st.set_page_config(page_title="Visualisasi Data Seismik", layout="wide")
+
+# --- JUDUL & INTRO ---
+st.title("Visualisasi dan Pemrosesan Data Seismik SEG-Y")
+st.markdown("""
+Aplikasi ini digunakan untuk memuat, menganalisis, dan memvisualisasikan data seismik format SEG-Y.
+Mendukung visualisasi interaktif dengan kontrol parameter.
+""")
+
+# --- FUNGSI MEMUAT DATA SEG-Y ---
+def load_segy_data(segy_path):
+    """Membaca data SEG-Y dan mengembalikan data serta header"""
+    with segyio.open(segy_path, "r", ignore_geometry=True) as f:
+        # Text Header
+        text_header_raw = f.text[0]
+        text_header = wrap(text_header_raw)
+        
+        # Binary Header
+        bin_header = f.bin
+        ns = bin_header[segyio.BinField.Samples]
+        dt = bin_header[segyio.BinField.Interval]
+        ntraces = f.tracecount
+        
+        # Load Data
+        data = np.zeros((ntraces, ns), dtype=np.float32)
+        for i in range(ntraces):
+            data[i, :] = f.trace[i]
+        
+        # Load Trace Headers
+        trace_headers = {}
+        for i in range(min(ntraces, 100)):  # Batasi untuk performa
+            header = f.header[i]
+            for key in segyio.TraceField.enums():
+                try:
+                    value = header[key]
+                    if key not in trace_headers:
+                        trace_headers[key] = []
+                    trace_headers[key].append(value)
+                except:
+                    pass
+    
+    return data, text_header, bin_header, trace_headers, dt, ntraces, ns
+
+# --- SIDEBAR: UPLOAD DATA ---
+st.sidebar.header("Input Data SEG-Y")
+uploaded_file = st.sidebar.file_uploader("Upload file SEG-Y (.sgy, .segy)", type=['sgy', 'segy'])
+
+if uploaded_file is None:
+    st.info("Silakan upload file SEG-Y untuk memulai")
+    st.stop()
+
+# Simpan file sementara
+with open("temp_segy.sgy", "wb") as f:
+    f.write(uploaded_file.getbuffer())
+
+# Muat data
+with st.spinner("Memuat data SEG-Y..."):
+    data, text_header, bin_header, trace_headers, dt, ntraces, ns = load_segy_data("temp_segy.sgy")
+
+# --- INFORMASI HEADER ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Informasi File")
+
+st.sidebar.text(f"Jumlah Trace: {ntraces}")
+st.sidebar.text(f"Samples per Trace: {ns}")
+st.sidebar.text(f"Sample Interval: {dt} μs")
+st.sidebar.text(f"Dimensi Data: {data.shape}")
+
+# Tampilkan Text Header
+with st.expander("Lihat Text Header"):
+    st.text(text_header)
+
+# --- CHALLENGE IMPLEMENTATION ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Pengaturan Visualisasi")
+
+# 1. Pilihan Colormap
+cmap_options = ['seismic', 'gray', 'viridis', 'plasma', 'inferno', 'magma', 'coolwarm', 'jet']
+selected_cmap = st.sidebar.selectbox("Pilih Colormap", cmap_options, index=0)
+
+# 2. Kontrol Vmin dan Vmax
+scale_mode = st.sidebar.radio("Mode Skala Amplitudo", ["Auto", "Manual"])
+if scale_mode == "Manual":
+    vmin = st.sidebar.slider("Nilai Minimum (vmin)", -1.0, 0.0, -0.5, 0.01)
+    vmax = st.sidebar.slider("Nilai Maksimum (vmax)", 0.0, 1.0, 0.5, 0.01)
+    clim = (vmin, vmax)
+else:
+    clim = None
+
+# 3. Rentang Trace untuk Ditampilkan
+trace_start = st.sidebar.slider("Trace Awal", 0, ntraces-1, 0, 1)
+trace_end = st.sidebar.slider("Trace Akhir", 0, ntraces-1, min(100, ntraces-1), 1)
+trace_end = max(trace_end, trace_start + 1)
+
+# 4. Rentang Waktu (Sample)
+time_start = st.sidebar.slider("Sample Awal", 0, ns-1, 0, 10)
+time_end = st.sidebar.slider("Sample Akhir", 0, ns-1, ns-1, 10)
+time_end = max(time_end, time_start + 10)
+
+# 5. Opsi Tambahan
+reverse_time = st.sidebar.checkbox("Balik Sumbu Waktu", value=False)
+gain = st.sidebar.slider("Gain Amplifikasi", 0.1, 5.0, 1.0, 0.1)
+
+# --- VISUALISASI DATA SEISMIK ---
+st.subheader("Visualisasi Data Seismik")
+
+# Pilih subset data
+subset_data = data[trace_start:trace_end, time_start:time_end] * gain
+
+# Buat waktu untuk sumbu y
+time_axis = np.arange(time_start, time_end) * (dt / 1000000)  # Konversi ke detik
+
+fig, ax = plt.subplots(figsize=(12, 8))
+
+# Plot data seismik
+img = ax.imshow(subset_data.T, 
+                aspect='auto', 
+                cmap=selected_cmap,
+                extent=[trace_start, trace_end, time_axis[-1] if reverse_time else time_axis[0], 
+                        time_axis[0] if reverse_time else time_axis[-1]],
+                clim=clim)
+
+ax.set_xlabel('Trace Number')
+ax.set_ylabel('Time (s)')
+ax.set_title(f'Seismic Section (Traces {trace_start}-{trace_end}, Time {time_axis[0]:.2f}-{time_axis[-1]:.2f}s)')
+
+# Tambahkan colorbar
+cbar = fig.colorbar(img, ax=ax, orientation='vertical')
+cbar.set_label('Amplitude')
+
+st.pyplot(fig)
+
+# --- STATISTIK DATA ---
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Mean Amplitude", f"{np.nanmean(subset_data):.4f}")
+with col2:
+    st.metric("Max Amplitude", f"{np.nanmax(subset_data):.4f}")
+with col3:
+    st.metric("Min Amplitude", f"{np.nanmin(subset_data):.4f}")
+
+# --- OPSI EKSPOR ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Ekspor Data")
+
+if st.sidebar.button("Simpan Plot Sebagai Gambar"):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches='tight')
+    st.sidebar.download_button(
+        label="Download Plot Seismik",
+        data=buf,
+        file_name="seismic_section.png",
+        mime="image/png"
+    )
+
+# Ekspor data subset
+if st.sidebar.button("Ekspor Data Subset ke CSV"):
+    # Buat DataFrame untuk trace header subset
+    df_subset = pd.DataFrame()
+    for key in list(trace_headers.keys())[:10]:  # Ambil 10 header pertama
+        if len(trace_headers[key]) >= trace_end:
+            df_subset[key] = trace_headers[key][trace_start:trace_end]
+    
+    # Tambahkan data seismik
+    for i in range(subset_data.shape[1]):
+        df_subset[f'sample_{i}'] = subset_data[:, i]
+    
+    csv = df_subset.to_csv(index=False)
+    st.sidebar.download_button(
+        label="Download CSV",
+        data=csv,
+        file_name="seismic_subset.csv",
+        mime="text/csv"
+    )
+
+# --- INFORMASI TRACE HEADER ---
+with st.expander("Lihat Trace Header (10 Trace Pertama)"):
+    if trace_headers:
+        df_headers = pd.DataFrame({k: v[:10] for k, v in trace_headers.items() if len(v) >= 10})
+        st.dataframe(df_headers.head(10))
+
+st.success(f"Data SEG-Y berhasil dimuat: {ntraces} trace, {ns} samples per trace")
